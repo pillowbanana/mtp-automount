@@ -55,6 +55,12 @@ DETECT_INTERVAL="${MTP_DETECT_INTERVAL:-2}"
 # Give the phone this much time after a USB event before probing.
 USB_SETTLE_DELAY="${MTP_USB_SETTLE_DELAY:-0.5}"
 
+# Number of consecutive probes in which a mounted device is not present
+# in the USB enumeration before its mount is considered gone and
+# unmounted.  A small grace period avoids unmounting a healthy mount
+# during a transient enumeration hiccup or momentary USB wobble.
+MISSING_PROBE_LIMIT="${MTP_MISSING_PROBE_LIMIT:-2}"
+
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/mtp-automount"
 STATE_DIR="$RUNTIME_DIR/mounts"
 LOG_DIR="$RUNTIME_DIR/logs"
@@ -68,6 +74,7 @@ declare -A MOUNT_ID
 declare -A MOUNT_NAME
 declare -A MOUNT_SERIAL
 declare -A MOUNT_LOG
+declare -A MOUNT_MISSING
 
 declare -A DEVICE_RAW
 declare -A DEVICE_VENDOR
@@ -75,6 +82,7 @@ declare -A DEVICE_MODEL
 declare -A DEVICE_SERIAL
 declare -A DEVICE_FRIENDLY
 declare -A DEVICE_READY
+declare -A DEVICE_PRESENT
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -158,6 +166,37 @@ clear_device_metadata() {
     DEVICE_SERIAL=()
     DEVICE_FRIENDLY=()
     DEVICE_READY=()
+    DEVICE_PRESENT=()
+}
+
+#
+# True when the given simple-mtpfs device number is currently mounted.
+#
+is_device_mounted() {
+    local want="$1"
+    local mp
+
+    for mp in "${!MOUNT_DEVICE[@]}"; do
+        if [ "${MOUNT_DEVICE[$mp]:-}" = "$want" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#
+# True when at least one present device is not currently mounted; only in
+# that case is it worth running mtp-detect (which opens an MTP session).
+#
+has_unmounted_present_device() {
+    local num
+
+    for num in "${!DEVICE_PRESENT[@]}"; do
+        is_device_mounted "$num" || return 0
+    done
+
+    return 1
 }
 
 #
@@ -166,20 +205,16 @@ clear_device_metadata() {
 # Do NOT depend on a specific number of leading spaces. libmtp's output is
 # indented, and the indentation can differ between versions/devices.
 #
-probe_mtp_devices() {
-    local output
+# mtp-detect opens an MTP session on every device it finds, so it is only
+# ever called for devices we still want to mount.  Devices already held by
+# simple-mtpfs report "device is busy" to mtp-detect and are skipped here.
+#
+parse_mtp_detect() {
+    local output="$1"
     local line
 
     local current=""
     local ready=0
-
-    clear_device_metadata
-
-    output="$(
-        timeout "$DETECT_TIMEOUT" \
-            mtp-detect 2>&1 ||
-        true
-    )"
 
     while IFS= read -r line; do
 
@@ -208,6 +243,16 @@ probe_mtp_devices() {
             local vid="${BASH_REMATCH[2]}"
             local pid="${BASH_REMATCH[3]}"
             local description="${BASH_REMATCH[4]}"
+
+            #
+            # A mounted device is held by simple-mtpfs; mtp-detect can not
+            # probe it, so ignore everything it reports about it.
+            #
+            if is_device_mounted "$current"; then
+                current=""
+                ready=0
+                continue
+            fi
 
             DEVICE_RAW["$current"]="$description"
             DEVICE_VENDOR["$current"]="$vid:$pid"
@@ -276,29 +321,48 @@ probe_mtp_devices() {
     if [ -n "$current" ]; then
         DEVICE_READY["$current"]="$ready"
     fi
+}
 
-    #
-    # Merge simple-mtpfs enumeration as fallback metadata.
-    #
+probe_mtp_devices() {
     local num
     local raw_name
+    local output
 
+    clear_device_metadata
+
+    #
+    # Enumerate present devices with `simple-mtpfs --list-devices`.  This
+    # only lists raw USB devices and never opens an MTP session, so it
+    # never conflicts with an already-mounted device.
+    #
     while IFS='|' read -r num raw_name; do
         [ -n "$num" ] || continue
 
+        DEVICE_PRESENT["$num"]=1
         DEVICE_RAW["$num"]="${DEVICE_RAW[$num]:-$raw_name}"
-
         DEVICE_MODEL["$num"]="${DEVICE_MODEL[$num]:-}"
-
         DEVICE_SERIAL["$num"]="${DEVICE_SERIAL[$num]:-}"
-
         DEVICE_FRIENDLY["$num"]="${DEVICE_FRIENDLY[$num]:-}"
-
         DEVICE_VENDOR["$num"]="${DEVICE_VENDOR[$num]:-unknown}"
-
         DEVICE_READY["$num"]="${DEVICE_READY[$num]:-0}"
 
     done < <(list_devices_raw)
+
+    #
+    # Only probe with mtp-detect when there is an unmounted device that
+    # might be mountable.  Probing a device that is currently mounted
+    # would fail anyway ("device is busy") and is what used to force the
+    # mount/unmount loop.
+    #
+    has_unmounted_present_device || return 0
+
+    output="$(
+        timeout "$DETECT_TIMEOUT" \
+            mtp-detect 2>&1 ||
+        true
+    )"
+
+    parse_mtp_detect "$output"
 }
 
 usable_device_name() {
@@ -559,6 +623,48 @@ mount_new_devices() {
 }
 
 # ---------------------------------------------------------------------------
+# Unmount missing devices
+# ---------------------------------------------------------------------------
+
+#
+# After each probe we know, from `simple-mtpfs --list-devices`, which
+# devices are currently present on USB.  A tracked mount whose device is
+# no longer present has been physically disconnected or re-enumerated
+# away from MTP (e.g. back to "Charging only").
+#
+# To avoid a single flaky enumeration (or a momentary USB wobble)
+# unmounting a perfectly healthy mount, we require MISSING_PROBE_LIMIT
+# consecutive probes without the device before we unmount it.
+#
+unmount_missing_devices() {
+    local mp
+    local num
+
+    for mp in "${!MOUNT_PID[@]}"; do
+
+        num="${MOUNT_DEVICE[$mp]:-}"
+
+        if [ -n "$num" ] &&
+           [ -n "${DEVICE_PRESENT[$num]:-}" ]; then
+
+            MOUNT_MISSING["$mp"]=0
+            continue
+        fi
+
+        MOUNT_MISSING["$mp"]=$(( ${MOUNT_MISSING["$mp"]:-0} + 1 ))
+
+        if [ "${MOUNT_MISSING["$mp"]}" -ge "$MISSING_PROBE_LIMIT" ]; then
+
+            log "Device no longer present: $mp"
+            log "Unmounting."
+
+            cleanup_mount "$mp" 1
+        fi
+
+    done
+}
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 
@@ -607,7 +713,8 @@ cleanup_mount() {
         'MOUNT_ID[$mp]' \
         'MOUNT_NAME[$mp]' \
         'MOUNT_SERIAL[$mp]' \
-        'MOUNT_LOG[$mp]'
+        'MOUNT_LOG[$mp]' \
+        'MOUNT_MISSING[$mp]'
 }
 
 reap_dead_mounts() {
@@ -639,7 +746,8 @@ reap_dead_mounts() {
                 'MOUNT_ID[$mp]' \
                 'MOUNT_NAME[$mp]' \
                 'MOUNT_SERIAL[$mp]' \
-                'MOUNT_LOG[$mp]'
+                'MOUNT_LOG[$mp]' \
+                'MOUNT_MISSING[$mp]'
 
             continue
         fi
@@ -659,8 +767,14 @@ reap_dead_mounts() {
         #
         # Mount is present but no longer responding.
         #
+        # Use `ls -1l` as the liveness probe: the plain -1 listing can be
+        # served entirely from the kernel's directory-entry cache even when
+        # simple-mtpfs has lost its connection, while `-l` also stats every
+        # entry (FUSE re-fetches attributes after ~1s), forcing a real
+        # round-trip through simple-mtpfs.
+        #
         if ! timeout "$PROBE_TIMEOUT" \
-            ls -1 "$mp" >/dev/null 2>&1; then
+            ls -1l "$mp" >/dev/null 2>&1; then
 
             log "Mount is unresponsive: $mp"
             log "Forcing unmount."
@@ -737,6 +851,7 @@ cmd_daemon() {
     echo "  Detect interval:    ${DETECT_INTERVAL}s"
     echo "  Detect timeout:     ${DETECT_TIMEOUT}s"
     echo "  USB settle delay:   ${USB_SETTLE_DELAY}s"
+    echo "  Unmount grace:      ${MISSING_PROBE_LIMIT} probes"
     echo "  Runtime directory:  $RUNTIME_DIR"
     echo "  Log directory:      $LOG_DIR"
     echo
@@ -779,8 +894,10 @@ cmd_daemon() {
             usb_activity=0
 
             #
-            # Only mount devices for which storage is really available.
+            # Unmount devices that are no longer present on USB, then
+            # mount devices that are READY again.
             #
+            unmount_missing_devices
             mount_new_devices
         fi
 
@@ -1017,6 +1134,7 @@ cmd_status() {
     printf '  %-20s %ss\n' "Detect timeout:" "$DETECT_TIMEOUT"
     printf '  %-20s %ss\n' "Probe timeout:" "$PROBE_TIMEOUT"
     printf '  %-20s %ss\n' "USB settle delay:" "$USB_SETTLE_DELAY"
+    printf '  %-20s %s probes\n' "Unmount grace:" "$MISSING_PROBE_LIMIT"
     printf '  %-20s %s\n' "Runtime directory:" "$RUNTIME_DIR"
 
     echo
@@ -1259,6 +1377,7 @@ Environment variables:
   MTP_DETECT_TIMEOUT=4
   MTP_DETECT_INTERVAL=2
   MTP_USB_SETTLE_DELAY=0.5
+  MTP_MISSING_PROBE_LIMIT=2
 
 Examples:
 
