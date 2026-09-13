@@ -1,0 +1,1314 @@
+#!/usr/bin/env bash
+#
+# mtp-automount - MTP automount daemon for NixOS using simple-mtpfs.
+#
+# The daemon watches USB events and periodically probes libmtp. A device is
+# mounted only when mtp-detect confirms that MTP storage is actually available.
+#
+# This is important for Android phones: the USB device may already be present
+# while the phone is only charging. Selecting "File Transfer" can change the
+# available MTP functions without changing the basic USB enumeration.
+#
+# Commands:
+#
+#   daemon
+#       Start the automount daemon.
+#
+#   stop
+#       Stop the daemon. Existing mounts are kept.
+#
+#   list
+#       Probe libmtp and show detected devices and their state.
+#
+#   status
+#       Show daemon state, configuration and mounts.
+#
+#   umount <path>
+#       Unmount one mount.
+#
+#   umount all
+#       Unmount all mounts below BASE_DIR.
+#
+# NixOS dependencies:
+#
+#   pkgs.simple-mtpfs
+#   pkgs.libmtp
+#   programs.fuse.enable = true;
+#
+
+set -u
+
+BASE_DIR="/media"
+
+# How often the daemon wakes up when there are no USB events.
+SAFETY_POLL="${MTP_SAFETY_POLL:-2}"
+
+# Maximum time allowed for the filesystem responsiveness test.
+PROBE_TIMEOUT="${MTP_PROBE_TIMEOUT:-2}"
+
+# Maximum time allowed for one mtp-detect invocation.
+DETECT_TIMEOUT="${MTP_DETECT_TIMEOUT:-4}"
+
+# Minimum time between libmtp probes while a USB device is present.
+DETECT_INTERVAL="${MTP_DETECT_INTERVAL:-2}"
+
+# Give the phone this much time after a USB event before probing.
+USB_SETTLE_DELAY="${MTP_USB_SETTLE_DELAY:-0.5}"
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/mtp-automount"
+STATE_DIR="$RUNTIME_DIR/mounts"
+LOG_DIR="$RUNTIME_DIR/logs"
+LOCK_FILE="$RUNTIME_DIR/daemon.pid"
+
+mkdir -p "$STATE_DIR" "$LOG_DIR" 2>/dev/null || true
+
+declare -A MOUNT_PID
+declare -A MOUNT_DEVICE
+declare -A MOUNT_ID
+declare -A MOUNT_NAME
+declare -A MOUNT_SERIAL
+declare -A MOUNT_LOG
+
+declare -A DEVICE_RAW
+declare -A DEVICE_VENDOR
+declare -A DEVICE_MODEL
+declare -A DEVICE_SERIAL
+declare -A DEVICE_FRIENDLY
+declare -A DEVICE_READY
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+log() {
+    printf '[%(%H:%M:%S)T] %s\n' -1 "$*"
+}
+
+require_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "Error: '$1' was not found in PATH." >&2
+        echo "Add the required package to your NixOS configuration." >&2
+        exit 1
+    fi
+}
+
+sanitize_name() {
+    local name="$1"
+
+    name="${name//\//-}"
+
+    name="$(
+        printf '%s' "$name" |
+            tr -cs '[:alnum:]._' '-'
+    )"
+
+    name="$(
+        printf '%s' "$name" |
+            sed -e 's/^-*//' -e 's/-*$//'
+    )"
+
+    [ -n "$name" ] || name="MTP-device"
+
+    printf '%s' "$name"
+}
+
+ensure_base_dir() {
+    if [ -d "$BASE_DIR" ] && [ -w "$BASE_DIR" ]; then
+        return 0
+    fi
+
+    if ! {
+        mkdir -p "$BASE_DIR" 2>/dev/null &&
+        [ -w "$BASE_DIR" ]
+    }; then
+        cat >&2 <<EOF
+Error: $BASE_DIR is not writable by the current user.
+
+On NixOS, add something like:
+
+  systemd.tmpfiles.rules = [
+    "d /media 0755 your-user users -"
+  ];
+
+Then run:
+
+  sudo systemd-tmpfiles --create
+EOF
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# simple-mtpfs device enumeration
+# ---------------------------------------------------------------------------
+
+list_devices_raw() {
+    simple-mtpfs --list-devices 2>/dev/null |
+        sed -n 's/^\([0-9][0-9]*\): \(.*\)$/\1|\2/p'
+}
+
+# ---------------------------------------------------------------------------
+# libmtp probing
+# ---------------------------------------------------------------------------
+
+clear_device_metadata() {
+    DEVICE_RAW=()
+    DEVICE_VENDOR=()
+    DEVICE_MODEL=()
+    DEVICE_SERIAL=()
+    DEVICE_FRIENDLY=()
+    DEVICE_READY=()
+}
+
+#
+# Parse mtp-detect output.
+#
+# Do NOT depend on a specific number of leading spaces. libmtp's output is
+# indented, and the indentation can differ between versions/devices.
+#
+probe_mtp_devices() {
+    local output
+    local line
+
+    local current=""
+    local ready=0
+
+    clear_device_metadata
+
+    output="$(
+        timeout "$DETECT_TIMEOUT" \
+            mtp-detect 2>&1 ||
+        true
+    )"
+
+    while IFS= read -r line; do
+
+        #
+        # Device declaration:
+        #
+        # Device 0 (VID=xxxx and PID=yyyy) is ...
+        #
+        if [[ "$line" =~ ^[[:space:]]*Device[[:space:]]+([0-9]+)[[:space:]]+\(VID=([0-9a-fA-F]+)[[:space:]]+and[[:space:]]+PID=([0-9a-fA-F]+)\)[[:space:]]+is[[:space:]]+(.+)$ ]]; then
+
+            #
+            # Finalize previous device.
+            #
+            if [ -n "$current" ]; then
+                DEVICE_READY["$current"]="$ready"
+            fi
+
+            #
+            # mtp-detect numbers devices from 0, but simple-mtpfs uses
+            # 1-based device numbers (see `simple-mtpfs --list-devices`).
+            # Convert here so every device number in this script can be
+            # passed directly to `simple-mtpfs --device`.
+            #
+            current="$((BASH_REMATCH[1] + 1))"
+
+            local vid="${BASH_REMATCH[2]}"
+            local pid="${BASH_REMATCH[3]}"
+            local description="${BASH_REMATCH[4]}"
+
+            DEVICE_RAW["$current"]="$description"
+            DEVICE_VENDOR["$current"]="$vid:$pid"
+
+            DEVICE_MODEL["$current"]=""
+            DEVICE_SERIAL["$current"]=""
+            DEVICE_FRIENDLY["$current"]=""
+
+            ready=0
+
+            continue
+        fi
+
+        [ -n "$current" ] || continue
+
+        #
+        # Model:
+        #
+        #       Model: EPIX PRO - 51mm
+        #
+        if [[ "$line" =~ ^[[:space:]]*Model:[[:space:]]*(.*)$ ]]; then
+            DEVICE_MODEL["$current"]="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        #
+        # Serial number:
+        #
+        if [[ "$line" =~ ^[[:space:]]*Serial[[:space:]]+number:[[:space:]]*(.*)$ ]]; then
+            DEVICE_SERIAL["$current"]="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        #
+        # Friendly name:
+        #
+        if [[ "$line" =~ ^[[:space:]]*Friendly[[:space:]]+name:[[:space:]]*(.*)$ ]]; then
+            DEVICE_FRIENDLY["$current"]="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        #
+        # Storage Devices:
+        #
+        # This is our main readiness signal.
+        #
+        if [[ "$line" =~ ^[[:space:]]*Storage[[:space:]]+Devices:[[:space:]]*$ ]]; then
+            ready=1
+            continue
+        fi
+
+        #
+        # StorageID is an additional confirmation that libmtp got real
+        # storage information from the device.
+        #
+        if [[ "$line" =~ ^[[:space:]]*StorageID:[[:space:]]* ]]; then
+            ready=1
+            continue
+        fi
+
+    done <<< "$output"
+
+    #
+    # Finalize the last device.
+    #
+    if [ -n "$current" ]; then
+        DEVICE_READY["$current"]="$ready"
+    fi
+
+    #
+    # Merge simple-mtpfs enumeration as fallback metadata.
+    #
+    local num
+    local raw_name
+
+    while IFS='|' read -r num raw_name; do
+        [ -n "$num" ] || continue
+
+        DEVICE_RAW["$num"]="${DEVICE_RAW[$num]:-$raw_name}"
+
+        DEVICE_MODEL["$num"]="${DEVICE_MODEL[$num]:-}"
+
+        DEVICE_SERIAL["$num"]="${DEVICE_SERIAL[$num]:-}"
+
+        DEVICE_FRIENDLY["$num"]="${DEVICE_FRIENDLY[$num]:-}"
+
+        DEVICE_VENDOR["$num"]="${DEVICE_VENDOR[$num]:-unknown}"
+
+        DEVICE_READY["$num"]="${DEVICE_READY[$num]:-0}"
+
+    done < <(list_devices_raw)
+}
+
+usable_device_name() {
+    local num="$1"
+    local name=""
+
+    #
+    # Model is preferred because this is normally what you want as the
+    # mount directory:
+    #
+    #   Nothing Phone (2)
+    #   Google Pixel 9
+    #   Samsung SM-S918B
+    #
+    name="${DEVICE_MODEL[$num]:-}"
+
+    #
+    # Friendly name is a good second choice.
+    #
+    [ -n "$name" ] || name="${DEVICE_FRIENDLY[$num]:-}"
+
+    #
+    # Last resort: libmtp raw descriptor.
+    #
+    [ -n "$name" ] || name="${DEVICE_RAW[$num]:-}"
+
+    sanitize_name "$name"
+}
+
+device_identity() {
+    local num="$1"
+
+    #
+    # Serial is the best persistent identity.
+    #
+    if [ -n "${DEVICE_SERIAL[$num]:-}" ] &&
+       [ "${DEVICE_SERIAL[$num]}" != "(null)" ]; then
+
+        printf 'serial:%s' "${DEVICE_SERIAL[$num]}"
+
+    else
+
+        #
+        # Fallback identity if the device has no serial.
+        #
+        printf 'device:%s:%s' \
+            "$num" \
+            "${DEVICE_MODEL[$num]:-${DEVICE_RAW[$num]:-unknown}}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Mountpoint handling
+# ---------------------------------------------------------------------------
+
+find_free_mountpoint() {
+    local base="$1"
+    local suffix=0
+    local candidate
+
+    while true; do
+
+        if [ "$suffix" -eq 0 ]; then
+            candidate="$BASE_DIR/$base"
+        else
+            candidate="$BASE_DIR/$base-$suffix"
+        fi
+
+        #
+        # Completely unused path.
+        #
+        if [ ! -e "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+
+        #
+        # Reuse an empty, non-mounted directory.
+        #
+        if [ -z "${MOUNT_PID[$candidate]:-}" ] &&
+           ! mountpoint -q "$candidate" 2>/dev/null; then
+
+            if [ -d "$candidate" ] &&
+               [ -z "$(ls -A "$candidate" 2>/dev/null)" ]; then
+
+                printf '%s' "$candidate"
+                return 0
+            fi
+        fi
+
+        suffix=$((suffix + 1))
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Persistent state
+# ---------------------------------------------------------------------------
+
+state_file_for_pid() {
+    printf '%s/%s.state' "$STATE_DIR" "$1"
+}
+
+write_mount_state() {
+    local pid="$1"
+    local mount_point="$2"
+    local device="$3"
+    local serial="$4"
+    local name="$5"
+    local log_file="$6"
+
+    local file
+    file="$(state_file_for_pid "$pid")"
+
+    {
+        printf '%s\n' "$mount_point"
+        printf '%s\n' "$device"
+        printf '%s\n' "$serial"
+        printf '%s\n' "$name"
+        printf '%s\n' "$log_file"
+    } > "$file"
+}
+
+remove_mount_state() {
+    rm -f "$(state_file_for_pid "$1")"
+}
+
+# ---------------------------------------------------------------------------
+# Mounting
+# ---------------------------------------------------------------------------
+
+start_mount() {
+    local num="$1"
+    local name="$2"
+    local mount_point="$3"
+    local serial="$4"
+
+    local log_file
+    local pid
+    local tries=0
+
+    log_file="$LOG_DIR/mtp-${num}-$(date +%s%N).log"
+
+    if ! mkdir -p "$mount_point" 2>/dev/null; then
+        log "Error: unable to create $mount_point"
+        return 1
+    fi
+
+    log "Mounting '$name' at $mount_point..."
+
+    #
+    # -v is required so that simple-mtpfs actually writes its diagnostics
+    # to the log file: without it, simple-mtpfs buffers (or drops) output
+    # when stdout/stderr are not a terminal and failures leave empty logs.
+    #
+    simple-mtpfs \
+        --device "$num" \
+        "$mount_point" \
+        -v \
+        -f >"$log_file" 2>&1 &
+
+    pid=$!
+
+    disown 2>/dev/null || true
+
+    while ! mountpoint -q "$mount_point" 2>/dev/null; do
+
+        if ! kill -0 "$pid" 2>/dev/null; then
+
+            log "Error: simple-mtpfs exited before mounting."
+            log "Log: $log_file"
+
+            rmdir "$mount_point" 2>/dev/null || true
+
+            return 1
+        fi
+
+        tries=$((tries + 1))
+
+        if [ "$tries" -ge 30 ]; then
+
+            log "Error: mount timed out."
+            log "Log: $log_file"
+
+            kill -9 "$pid" 2>/dev/null || true
+
+            fusermount -uz "$mount_point" 2>/dev/null || true
+
+            rmdir "$mount_point" 2>/dev/null || true
+
+            return 1
+        fi
+
+        sleep 0.5
+    done
+
+    MOUNT_PID["$mount_point"]="$pid"
+    MOUNT_DEVICE["$mount_point"]="$num"
+    MOUNT_ID["$mount_point"]="$(device_identity "$num")"
+    MOUNT_NAME["$mount_point"]="$name"
+    MOUNT_SERIAL["$mount_point"]="$serial"
+    MOUNT_LOG["$mount_point"]="$log_file"
+
+    write_mount_state \
+        "$pid" \
+        "$mount_point" \
+        "$num" \
+        "$serial" \
+        "$name" \
+        "$log_file"
+
+    log "Mounted '$name' -> $mount_point (PID $pid)"
+
+    return 0
+}
+
+mount_new_devices() {
+    local num
+    local name
+    local serial
+    local identity
+    local mount_point
+    local mp
+
+    for num in "${!DEVICE_READY[@]}"; do
+
+        #
+        # Do not mount devices which are only charging / otherwise not
+        # exposing MTP storage.
+        #
+        [ "${DEVICE_READY[$num]:-0}" -eq 1 ] || continue
+
+        name="$(usable_device_name "$num")"
+        serial="${DEVICE_SERIAL[$num]:-}"
+        identity="$(device_identity "$num")"
+
+        local already_mounted=0
+
+        for mp in "${!MOUNT_PID[@]}"; do
+
+            if [ "${MOUNT_ID[$mp]:-}" = "$identity" ]; then
+                already_mounted=1
+                break
+            fi
+
+        done
+
+        [ "$already_mounted" -eq 0 ] || continue
+
+        mount_point="$(find_free_mountpoint "$name")"
+
+        start_mount \
+            "$num" \
+            "$name" \
+            "$mount_point" \
+            "$serial" || true
+
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+cleanup_mount() {
+    local mp="$1"
+    local force_kill="${2:-0}"
+
+    local pid="${MOUNT_PID[$mp]:-}"
+
+    #
+    # Remove FUSE mount first.
+    #
+    if mountpoint -q "$mp" 2>/dev/null; then
+        fusermount -uz "$mp" 2>/dev/null || true
+    fi
+
+    #
+    # Stop simple-mtpfs.
+    #
+    if [ -n "$pid" ] &&
+       kill -0 "$pid" 2>/dev/null; then
+
+        kill -TERM "$pid" 2>/dev/null || true
+
+        sleep 0.1
+
+        if [ "$force_kill" -eq 1 ] &&
+           kill -0 "$pid" 2>/dev/null; then
+
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    fi
+
+    #
+    # Remove empty directory.
+    #
+    rmdir "$mp" 2>/dev/null || true
+
+    if [ -n "$pid" ]; then
+        remove_mount_state "$pid"
+    fi
+
+    unset \
+        'MOUNT_PID[$mp]' \
+        'MOUNT_DEVICE[$mp]' \
+        'MOUNT_ID[$mp]' \
+        'MOUNT_NAME[$mp]' \
+        'MOUNT_SERIAL[$mp]' \
+        'MOUNT_LOG[$mp]'
+}
+
+reap_dead_mounts() {
+    local mp
+    local pid
+
+    for mp in "${!MOUNT_PID[@]}"; do
+
+        pid="${MOUNT_PID[$mp]}"
+
+        #
+        # Process disappeared.
+        #
+        if ! kill -0 "$pid" 2>/dev/null; then
+
+            log "Cleaning up dead mount: $mp"
+
+            if mountpoint -q "$mp" 2>/dev/null; then
+                fusermount -uz "$mp" 2>/dev/null || true
+            fi
+
+            rmdir "$mp" 2>/dev/null || true
+
+            remove_mount_state "$pid"
+
+            unset \
+                'MOUNT_PID[$mp]' \
+                'MOUNT_DEVICE[$mp]' \
+                'MOUNT_ID[$mp]' \
+                'MOUNT_NAME[$mp]' \
+                'MOUNT_SERIAL[$mp]' \
+                'MOUNT_LOG[$mp]'
+
+            continue
+        fi
+
+        #
+        # FUSE mount disappeared even though simple-mtpfs is still alive.
+        #
+        if ! mountpoint -q "$mp" 2>/dev/null; then
+
+            log "Mount disappeared: $mp"
+
+            cleanup_mount "$mp" 1
+
+            continue
+        fi
+
+        #
+        # Mount is present but no longer responding.
+        #
+        if ! timeout "$PROBE_TIMEOUT" \
+            ls -1 "$mp" >/dev/null 2>&1; then
+
+            log "Mount is unresponsive: $mp"
+            log "Forcing unmount."
+
+            cleanup_mount "$mp" 1
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Daemon
+# ---------------------------------------------------------------------------
+
+cmd_daemon() {
+    ensure_base_dir
+
+    mkdir -p "$RUNTIME_DIR" "$STATE_DIR" "$LOG_DIR"
+
+    if [ -f "$LOCK_FILE" ]; then
+
+        local old_pid
+        old_pid="$(cat "$LOCK_FILE" 2>/dev/null || true)"
+
+        if [ -n "$old_pid" ] &&
+           kill -0 "$old_pid" 2>/dev/null; then
+
+            echo "A daemon is already running."
+            echo "  PID: $old_pid"
+            echo
+            echo "Use:"
+            echo "  $0 status"
+            echo "  $0 stop"
+
+            exit 1
+        fi
+
+        rm -f "$LOCK_FILE"
+    fi
+
+    echo "$$" > "$LOCK_FILE"
+
+    local udev_fd=""
+
+    exec {udev_fd}< <(
+        udevadm monitor \
+            --udev \
+            --subsystem-match=usb \
+            2>/dev/null
+    )
+
+    cleanup_and_exit() {
+        rm -f "$LOCK_FILE"
+
+        if [ -n "$udev_fd" ]; then
+            exec {udev_fd}<&- 2>/dev/null || true
+        fi
+    }
+
+    trap cleanup_and_exit EXIT
+
+    trap '
+        log "Stopping daemon."
+        log "Existing mounts are kept."
+        log "Use: '"$0"' umount all"
+        exit 0
+    ' INT TERM
+
+    echo
+    echo "MTP automount daemon started."
+    echo
+    echo "  PID:                $$"
+    echo "  Base directory:     $BASE_DIR"
+    echo "  Safety poll:        ${SAFETY_POLL}s"
+    echo "  Detect interval:    ${DETECT_INTERVAL}s"
+    echo "  Detect timeout:     ${DETECT_TIMEOUT}s"
+    echo "  USB settle delay:   ${USB_SETTLE_DELAY}s"
+    echo "  Runtime directory:  $RUNTIME_DIR"
+    echo "  Log directory:      $LOG_DIR"
+    echo
+    echo "Waiting for MTP devices..."
+    echo
+
+    local last_detect=0
+    local now
+    local udev_line
+    local rc
+    local usb_activity=0
+
+    while true; do
+
+        reap_dead_mounts
+
+        now="$(date +%s)"
+
+        #
+        # IMPORTANT:
+        #
+        # Probe periodically regardless of whether --list-devices changed.
+        #
+        # This is what catches Android switching from:
+        #
+        #   Charging
+        #
+        # to:
+        #
+        #   File Transfer
+        #
+        # without requiring a new USB enumeration.
+        #
+        if [ "$usb_activity" -eq 1 ] ||
+           [ $((now - last_detect)) -ge "$DETECT_INTERVAL" ]; then
+
+            probe_mtp_devices
+
+            last_detect="$now"
+            usb_activity=0
+
+            #
+            # Only mount devices for which storage is really available.
+            #
+            mount_new_devices
+        fi
+
+        #
+        # Wait for USB activity, but wake up periodically anyway.
+        #
+        if [ -n "$udev_fd" ]; then
+
+            read -r -t "$SAFETY_POLL" \
+                -u "$udev_fd" \
+                udev_line
+
+            rc=$?
+
+            if [ "$rc" -eq 0 ]; then
+
+                log "USB activity detected; re-probing MTP shortly."
+
+                sleep "$USB_SETTLE_DELAY"
+
+                #
+                # Drain queued USB events.
+                #
+                while read -r -t 0.05 \
+                    -u "$udev_fd" \
+                    udev_line; do
+                    :
+                done
+
+                usb_activity=1
+
+            elif [ "$rc" -le 128 ]; then
+
+                log "udevadm monitor stopped."
+                log "Falling back to periodic polling."
+
+                exec {udev_fd}<&- 2>/dev/null || true
+                udev_fd=""
+
+                sleep "$SAFETY_POLL"
+            fi
+
+        else
+
+            sleep "$SAFETY_POLL"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Stop
+# ---------------------------------------------------------------------------
+
+get_daemon_pid() {
+    [ -f "$LOCK_FILE" ] || return 1
+
+    local pid
+
+    pid="$(cat "$LOCK_FILE" 2>/dev/null || true)"
+
+    [ -n "$pid" ] || return 1
+
+    printf '%s' "$pid"
+}
+
+cmd_stop() {
+    local pid
+    local tries=0
+
+    if ! pid="$(get_daemon_pid)"; then
+
+        echo "Daemon: not running."
+        echo "No valid PID file found."
+
+        return 1
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+
+        echo "Daemon: not running."
+        echo "Removing stale PID file."
+
+        rm -f "$LOCK_FILE"
+
+        return 1
+    fi
+
+    echo "Stopping daemon..."
+    echo "  PID: $pid"
+
+    kill -TERM "$pid" 2>/dev/null || true
+
+    while kill -0 "$pid" 2>/dev/null; do
+
+        tries=$((tries + 1))
+
+        if [ "$tries" -ge 30 ]; then
+
+            echo "Daemon did not exit in time."
+            echo "Sending SIGKILL..."
+
+            kill -9 "$pid" 2>/dev/null || true
+
+            break
+        fi
+
+        sleep 0.1
+    done
+
+    echo
+    echo "Daemon stopped."
+    echo "Existing MTP mounts were left untouched."
+    echo
+    echo "To remove all mounts:"
+    echo "  $0 umount all"
+}
+
+# ---------------------------------------------------------------------------
+# List
+# ---------------------------------------------------------------------------
+
+cmd_list() {
+    probe_mtp_devices
+
+    local any=0
+    local num
+
+    for num in "${!DEVICE_RAW[@]}"; do
+
+        local model
+        local friendly
+        local serial
+        local vendor
+        local raw
+        local ready
+        local name
+
+        model="${DEVICE_MODEL[$num]:-}"
+        friendly="${DEVICE_FRIENDLY[$num]:-}"
+        serial="${DEVICE_SERIAL[$num]:-}"
+        vendor="${DEVICE_VENDOR[$num]:-unknown}"
+        raw="${DEVICE_RAW[$num]:-unknown}"
+        ready="${DEVICE_READY[$num]:-0}"
+
+        name="$(usable_device_name "$num")"
+
+        echo "Device $num"
+        printf '  %-18s %s\n' "Model:" "${model:-unknown}"
+        printf '  %-18s %s\n' "Mount name:" "$name"
+        printf '  %-18s %s\n' "Friendly name:" "${friendly:-none}"
+        printf '  %-18s %s\n' "Serial:" "${serial:-none}"
+        printf '  %-18s %s\n' "USB ID:" "$vendor"
+        printf '  %-18s %s\n' "libmtp device:" "$raw"
+
+        if [ "$ready" -eq 1 ]; then
+
+            echo "  MTP storage:       READY"
+
+        else
+
+            echo "  MTP storage:       NOT READY"
+            echo
+            echo "  The phone is visible over USB, but libmtp is not"
+            echo "  currently reporting usable MTP storage."
+            echo "  Unlock the phone and select 'File Transfer'."
+        fi
+
+        echo
+
+        any=1
+    done
+
+    if [ "$any" -eq 0 ]; then
+        echo "No USB/MTP devices detected."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+
+print_table_header() {
+    printf '  %-20s %s\n' 'Field' 'Value'
+    printf '  %-20s %s\n' '--------------------' '------------------------------'
+}
+
+cmd_status() {
+    local pid
+    local state_file
+    local mp
+    local num
+    local serial
+    local name
+    local log_file
+    local found=0
+    local active=0
+
+    echo "MTP automount status"
+    echo "===================="
+    echo
+
+    echo "Daemon"
+    print_table_header
+
+    if pid="$(get_daemon_pid)" 2>/dev/null &&
+       kill -0 "$pid" 2>/dev/null; then
+
+        printf '  %-20s running\n' "State:"
+        printf '  %-20s %s\n' "PID:" "$pid"
+
+        local uptime
+        uptime="$(ps -p "$pid" -o etime= 2>/dev/null | xargs || true)"
+
+        if [ -n "$uptime" ]; then
+            printf '  %-20s %s\n' "Uptime:" "$uptime"
+        fi
+
+    else
+
+        printf '  %-20s stopped\n' "State:"
+
+        if [ -f "$LOCK_FILE" ]; then
+            printf '  %-20s stale PID file\n' "Note:"
+        fi
+    fi
+
+    echo
+    echo "Configuration"
+    print_table_header
+
+    printf '  %-20s %s\n' "Base directory:" "$BASE_DIR"
+    printf '  %-20s %ss\n' "Safety poll:" "$SAFETY_POLL"
+    printf '  %-20s %ss\n' "Detect interval:" "$DETECT_INTERVAL"
+    printf '  %-20s %ss\n' "Detect timeout:" "$DETECT_TIMEOUT"
+    printf '  %-20s %ss\n' "Probe timeout:" "$PROBE_TIMEOUT"
+    printf '  %-20s %ss\n' "USB settle delay:" "$USB_SETTLE_DELAY"
+    printf '  %-20s %s\n' "Runtime directory:" "$RUNTIME_DIR"
+
+    echo
+    echo "Tracked mounts"
+
+    shopt -s nullglob
+
+    for state_file in "$STATE_DIR"/*.state; do
+
+        found=1
+
+        mapfile -t state < "$state_file"
+
+        mp="${state[0]:-}"
+        num="${state[1]:-}"
+        serial="${state[2]:-}"
+        name="${state[3]:-}"
+        log_file="${state[4]:-}"
+
+        if mountpoint -q "$mp" 2>/dev/null; then
+
+            active=1
+
+            echo "  $mp"
+
+            printf '    %-17s %s\n' "Name:" "$name"
+            printf '    %-17s %s\n' "Device:" "$num"
+            printf '    %-17s %s\n' "Serial:" "${serial:-none}"
+            printf '    %-17s %s\n' "Log:" "$log_file"
+
+        else
+
+            echo "  STALE: $mp"
+
+            printf '    %-17s %s\n' "State file:" "$state_file"
+        fi
+
+    done
+
+    shopt -u nullglob
+
+    if [ "$found" -eq 0 ]; then
+        echo "  No daemon-tracked mounts."
+    fi
+
+    echo
+    echo "Mounts under $BASE_DIR"
+
+    local any_mount=0
+    local dir
+
+    shopt -s nullglob
+
+    for dir in "$BASE_DIR"/*/; do
+
+        [ -d "$dir" ] || continue
+
+        if mountpoint -q "$dir" 2>/dev/null; then
+
+            any_mount=1
+            printf '  %s\n' "${dir%/}"
+        fi
+
+    done
+
+    shopt -u nullglob
+
+    if [ "$any_mount" -eq 0 ]; then
+        echo "  No active mounts."
+    fi
+
+    echo
+    echo "Summary"
+
+    if [ "$active" -eq 1 ]; then
+        echo "  Managed MTP mounts: active"
+    else
+        echo "  Managed MTP mounts: none"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Unmount
+# ---------------------------------------------------------------------------
+
+find_state_for_mount() {
+    local target="$1"
+    local state_file
+    local mp
+
+    shopt -s nullglob
+
+    for state_file in "$STATE_DIR"/*.state; do
+
+        mp=""
+
+        IFS= read -r mp < "$state_file" || true
+
+        if [ "${mp%/}" = "${target%/}" ]; then
+
+            printf '%s' "$state_file"
+
+            shopt -u nullglob
+
+            return 0
+        fi
+    done
+
+    shopt -u nullglob
+
+    return 1
+}
+
+cmd_umount() {
+    local target="${1:-}"
+
+    local state_file
+    local pid
+    local mp
+    local dir
+
+    ensure_base_dir
+
+    if [ -z "$target" ] ||
+       [ "$target" = "all" ] ||
+       [ "$target" = "todos" ]; then
+
+        local any=0
+
+        shopt -s nullglob
+
+        for dir in "$BASE_DIR"/*/; do
+
+            [ -d "$dir" ] || continue
+
+            if mountpoint -q "$dir" 2>/dev/null; then
+
+                any=1
+                mp="${dir%/}"
+
+                echo "Unmounting $mp..."
+
+                fusermount -uz "$mp" 2>/dev/null || true
+
+                if state_file="$(find_state_for_mount "$mp")"; then
+
+                    mapfile -t state < "$state_file"
+
+                    pid="${state_file##*/}"
+                    pid="${pid%.state}"
+
+                    #
+                    # Our state filename is based on the actual simple-mtpfs
+                    # PID, so recover it directly.
+                    #
+                    pid="${pid}"
+
+                    kill -TERM "$pid" 2>/dev/null || true
+                    kill -9 "$pid" 2>/dev/null || true
+
+                    rm -f "$state_file"
+                fi
+
+                rmdir "$mp" 2>/dev/null || true
+
+                echo "  Removed: $mp"
+            fi
+        done
+
+        shopt -u nullglob
+
+        if [ "$any" -eq 0 ]; then
+            echo "No active mounts found under $BASE_DIR."
+        fi
+
+        return 0
+    fi
+
+    target="${target%/}"
+
+    if mountpoint -q "$target" 2>/dev/null; then
+
+        echo "Unmounting $target..."
+
+        fusermount -uz "$target" 2>/dev/null || true
+
+    else
+
+        echo "Not mounted: $target"
+    fi
+
+    if state_file="$(find_state_for_mount "$target")"; then
+
+        pid="${state_file##*/}"
+        pid="${pid%.state}"
+
+        kill -TERM "$pid" 2>/dev/null || true
+        kill -9 "$pid" 2>/dev/null || true
+
+        rm -f "$state_file"
+
+        echo "Removed daemon state."
+    fi
+
+    rmdir "$target" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") <command> [argument]
+
+Commands:
+
+  daemon
+      Start the automount daemon.
+
+  stop
+      Stop the daemon. Existing mounts are kept.
+
+  list
+      Probe libmtp and show USB/MTP device state.
+
+  status
+      Show daemon state, configuration and mounts.
+
+  umount <path>
+      Unmount one mount.
+
+  umount all
+      Unmount all mounts below $BASE_DIR.
+
+Environment variables:
+
+  MTP_SAFETY_POLL=2
+  MTP_PROBE_TIMEOUT=2
+  MTP_DETECT_TIMEOUT=4
+  MTP_DETECT_INTERVAL=2
+  MTP_USB_SETTLE_DELAY=0.5
+
+Examples:
+
+  $(basename "$0") daemon
+  $(basename "$0") list
+  $(basename "$0") status
+  $(basename "$0") umount all
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
+require_cmd simple-mtpfs
+require_cmd mtp-detect
+require_cmd fusermount
+require_cmd mountpoint
+require_cmd timeout
+require_cmd udevadm
+require_cmd ps
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+case "${1:-}" in
+
+    daemon)
+        cmd_daemon
+        ;;
+
+    stop)
+        cmd_stop
+        ;;
+
+    list)
+        cmd_list
+        ;;
+
+    status)
+        cmd_status
+        ;;
+
+    umount)
+        cmd_umount "${2:-}"
+        ;;
+
+    *)
+        usage
+        ;;
+
+esac
